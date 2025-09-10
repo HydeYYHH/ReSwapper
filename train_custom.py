@@ -1,0 +1,275 @@
+from datetime import datetime
+import os
+import random
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import argparse
+from datetime import datetime
+
+import Image
+import ModelFormat
+from StyleTransferLoss import StyleTransferLoss
+import onnxruntime as rt
+
+import cv2
+from insightface.data import get_image as ins_get_image
+from insightface.app import FaceAnalysis
+import face_align
+
+from StyleTransferModel_128 import StyleTransferModel
+from torch.utils.tensorboard import SummaryWriter
+
+inswapper_128_path = 'inswapper_128.onnx'
+img_size = 128
+
+providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+inswapperInferenceSession = rt.InferenceSession(inswapper_128_path, providers=providers)
+
+faceAnalysis = FaceAnalysis(name='buffalo_l')
+faceAnalysis.prepare(ctx_id=0, det_size=(512, 512))
+
+def get_device():
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+style_loss_fn = StyleTransferLoss().to(get_device())
+
+def train(sourceDatasetDir, targetDatasetDir, learning_rate=0.0001, model_path=None, outputModelFolder='', 
+           saveModelEachSteps=1, stopAtSteps=None, logDir=None, previewDir=None, 
+           saveAs_onnx=False, resolutions=[128], enableDataAugmentation=False):
+    device = get_device()
+    print(f"Using device: {device}")
+
+    model = StyleTransferModel().to(device)
+
+    if model_path is not None and os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+        print(f"Loaded model from {model_path}")
+
+        try:
+            lastSteps = int(model_path.split('-')[-1].split('.')[0])
+            print(f"Resuming training from step {lastSteps}")
+        except:
+            lastSteps = 0
+            print("Could not parse step number from model path, starting step count from 0.")
+
+    else:
+        lastSteps = 0
+        if model_path is not None:
+            print(f"Model path {model_path} not found. Starting from scratch.")
+
+    model.train()
+    model = model.to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    if logDir is not None:
+        train_writer = SummaryWriter(os.path.join(logDir, "training"))
+        val_writer = SummaryWriter(os.path.join(logDir, "validation"))
+
+    steps = 0
+
+    # Read images from source and target directories separately
+    source_images = os.listdir(sourceDatasetDir)
+    target_images = os.listdir(targetDatasetDir)
+    print(f"Found {len(source_images)} source images and {len(target_images)} target images.")
+
+    resolutionIndex = 0
+
+    while True:
+        start_time = datetime.now()
+        
+        resolution = resolutions[resolutionIndex%len(resolutions)]
+
+        # Randomly select images from their respective directories
+        targetFaceIndex = random.randint(0, len(target_images)-1)
+        sourceFaceIndex = random.randint(0, len(source_images)-1)
+
+        target_img = cv2.imread(os.path.join(targetDatasetDir, target_images[targetFaceIndex]))
+        source_img = cv2.imread(os.path.join(sourceDatasetDir, source_images[sourceFaceIndex]))
+
+        if target_img is None or source_img is None:
+            print("Warning: Could not read one of the images. Skipping step.")
+            continue
+        
+        if enableDataAugmentation and steps % 2 == 0:
+            target_img = cv2.cvtColor(target_img, cv2.COLOR_BGR2GRAY)
+            target_img = cv2.cvtColor(target_img, cv2.COLOR_GRAY2BGR)
+        
+        faces = faceAnalysis.get(target_img)
+        faces2 = faceAnalysis.get(source_img)
+
+        if len(faces) > 0 and len(faces2) > 0:
+            new_aligned_face, _ = face_align.norm_crop2(target_img, faces[0].kps, img_size)
+            blob = Image.getBlob(new_aligned_face)
+            latent = Image.getLatent(faces2[0])
+        else:
+            continue
+
+        input_data = {inswapperInferenceSession.get_inputs()[0].name: blob,
+                      inswapperInferenceSession.get_inputs()[1].name: latent}
+        expected_output = inswapperInferenceSession.run([inswapperInferenceSession.get_outputs()[0].name], input_data)[0]
+        expected_output_tensor = torch.from_numpy(expected_output).to(device)
+
+        if resolution != 128:
+            new_aligned_face, _ = face_align.norm_crop2(target_img, faces[0].kps, resolution)
+            blob = Image.getBlob(new_aligned_face, (resolution, resolution))
+
+        latent_tensor = torch.from_numpy(latent).to(device)
+        target_input_tensor = torch.from_numpy(blob).to(device)
+
+        optimizer.zero_grad()
+        output = model(target_input_tensor, latent_tensor)
+
+        if (resolution != 128):
+            output = F.interpolate(output, size=(128, 128), mode='bilinear', align_corners=False)
+
+        content_loss, identity_loss = style_loss_fn(output, expected_output_tensor)
+        loss = content_loss
+        if identity_loss is not None:
+            loss += identity_loss
+        
+        loss.backward()
+        optimizer.step()
+
+        steps += 1
+        totalSteps = steps + lastSteps
+
+        if logDir is not None:
+            train_writer.add_scalar("Loss/total", loss.item(), totalSteps)
+            train_writer.add_scalar("Loss/content_loss", content_loss.item(), totalSteps)
+            if identity_loss is not None:
+                train_writer.add_scalar("Loss/identity_loss", identity_loss.item(), totalSteps)
+
+        elapsed_time = datetime.now() - start_time
+        print(f"Total Steps: {totalSteps}, Step: {steps}, Loss: {loss.item():.4f}, Elapsed time: {elapsed_time}")
+
+        if steps % saveModelEachSteps == 0:
+            outputModelPath = f"reswapper-{totalSteps}.pth"
+            if outputModelFolder != '':
+                outputModelPath = os.path.join(outputModelFolder, outputModelPath)
+            saveModel(model, outputModelPath)
+
+            validation_total_loss, validation_content_loss, validation_identity_loss, swapped_face, swapped_face_256 = validate(outputModelPath)
+            if previewDir is not None:
+                cv2.imwrite(os.path.join(previewDir, f"{totalSteps}.jpg"), swapped_face)
+                cv2.imwrite(os.path.join(previewDir, f"{totalSteps}_256.jpg"), swapped_face_256)
+
+            if logDir is not None:
+                val_writer.add_scalar("Loss/total", validation_total_loss.item(), totalSteps)
+                val_writer.add_scalar("Loss/content_loss", validation_content_loss.item(), totalSteps)
+                if validation_identity_loss is not None:
+                    val_writer.add_scalar("Loss/identity_loss", validation_identity_loss.item(), totalSteps)
+
+            if saveAs_onnx :
+                ModelFormat.save_as_onnx_model(outputModelPath)
+
+        if stopAtSteps is not None and steps >= stopAtSteps:
+            print(f"Reached stopAtSteps {stopAtSteps}. Exiting.")
+            break 
+        
+        resolutionIndex += 1
+
+def saveModel(model, outputModelPath):
+    torch.save(model.state_dict(), outputModelPath)
+
+def load_model(model_path):
+    device = get_device()
+    model = StyleTransferModel().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+    model.eval()
+    return model
+
+def swap_face(model, target_face, source_face_latent):
+    device = get_device()
+    target_tensor = torch.from_numpy(target_face).to(device)
+    source_tensor = torch.from_numpy(source_face_latent).to(device)
+    with torch.no_grad():
+        swapped_tensor = model(target_tensor, source_tensor)
+    swapped_face = Image.postprocess_face(swapped_tensor)
+    return swapped_face, swapped_tensor
+
+# Setup for validation images
+test_img = ins_get_image('t1')
+test_faces = sorted(faceAnalysis.get(test_img), key = lambda x : x.bbox[0])
+test_target_face, _ = face_align.norm_crop2(test_img, test_faces[0].kps, img_size)
+test_target_face = Image.getBlob(test_target_face)
+test_l = Image.getLatent(test_faces[2])
+test_target_face_256, _ = face_align.norm_crop2(test_img, test_faces[0].kps, 256)
+test_target_face_256 = Image.getBlob(test_target_face_256, (256, 256))
+test_input = {inswapperInferenceSession.get_inputs()[0].name: test_target_face,
+              inswapperInferenceSession.get_inputs()[1].name: test_l}
+test_inswapperOutput = inswapperInferenceSession.run([inswapperInferenceSession.get_outputs()[0].name], test_input)[0]
+
+def validate(modelPath):
+    model = load_model(modelPath)
+    swapped_face, swapped_tensor = swap_face(model, test_target_face, test_l)
+    swapped_face_256, _ = swap_face(model, test_target_face_256, test_l)
+    validation_content_loss, validation_identity_loss = style_loss_fn(swapped_tensor, torch.from_numpy(test_inswapperOutput).to(get_device()))
+    validation_total_loss = validation_content_loss
+    if validation_identity_loss is not None:
+        validation_total_loss += validation_identity_loss
+    return validation_total_loss, validation_content_loss, validation_identity_loss, swapped_face, swapped_face_256
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Train ReSwapper model with custom datasets')
+    
+    # Required arguments
+    parser.add_argument('--source_dir', type=str, required=True, 
+                        help='Directory containing source face images (photos of the person you want to train)')
+    parser.add_argument('--target_dir', type=str, required=True, 
+                        help='Directory containing background images (photos of other people, like FFHQ)')
+    
+    # Optional arguments
+    parser.add_argument('--model_path', type=str, default=None, 
+                        help='Path to a pre-trained model for fine-tuning (optional)')
+    parser.add_argument('--output_dir', type=str, default='./model', 
+                        help='Directory to save trained models')
+    parser.add_argument('--log_dir', type=str, default='./training/log', 
+                        help='Directory for TensorBoard logs')
+    parser.add_argument('--preview_dir', type=str, default='./training/preview', 
+                        help='Directory to save preview images during training')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, 
+                        help='Learning rate for training')
+    parser.add_argument('--stop_steps', type=int, default=10000, 
+                        help='Number of steps to stop training')
+    parser.add_argument('--save_every', type=int, default=1000, 
+                        help='Save model every N steps')
+    parser.add_argument('--enable_augmentation', action='store_true', 
+                        help='Enable data augmentation')
+    parser.add_argument('--save_onnx', action='store_true', 
+                        help='Save model in ONNX format')
+    parser.add_argument('--resolutions', type=int, nargs='+', default=[128], 
+                        help='List of resolutions for multi-resolution training')
+    
+    return parser.parse_args()
+
+def main():
+    args = parse_arguments()
+    
+    # Create directories if they don't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.preview_dir, exist_ok=True)
+    
+    # Create unique log directory with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir_with_timestamp = os.path.join(args.log_dir, timestamp)
+    os.makedirs(log_dir_with_timestamp, exist_ok=True)
+    
+    train(
+        sourceDatasetDir=args.source_dir,
+        targetDatasetDir=args.target_dir,
+        model_path=args.model_path,
+        learning_rate=args.learning_rate,
+        resolutions=args.resolutions,
+        enableDataAugmentation=args.enable_augmentation,
+        outputModelFolder=args.output_dir,
+        saveModelEachSteps=args.save_every,
+        stopAtSteps=args.stop_steps,
+        logDir=log_dir_with_timestamp,
+        previewDir=args.preview_dir,
+        saveAs_onnx=args.save_onnx
+    )
+                    
+if __name__ == "__main__":
+    main()
